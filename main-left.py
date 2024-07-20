@@ -2,20 +2,30 @@ from ultralytics import YOLO
 from datetime import datetime, timedelta
 from time import time, sleep
 import cv2
-#from gpiozero import OutputDevice
-
+from gpiozero import OutputDevice, InputDevice
+from serial import Serial
 
 
 class AISectaVision:
     def __init__(self, weights, spray_duration, time_delay, zone_detection):
         self.cam = self.initialize_camera()
         self.model = self.load_model(weights)
-        self.spray_duration = spray_duration    # spray duration
-        self.time_delay = time_delay            # time delay after spraying to start detection
+        self.time_delay = time_delay
         self.detected = False                   
         self.time_detected = None
         self.zone_detection = self.calculate_detection_area(zone_detection)
-        # self.sprayer = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
+        
+        # sprayer
+        self.sprayer = OutputDevice(pin=23, active_high=True, initial_value=False)
+        self.spray_duration = spray_duration
+
+        # video
+        self.video_writer = self.initialize_video_writer()
+
+        # motor
+        self.pest_signal_right = InputDevice(pin=24, pull_up=False)
+        # self.stop_signal = OutputDevice(pin=25, active_high=True, initialize_value=False)
+        self.serial = Serial('/dev/ttyUSB0', 9600, timeout=1)
 
 
     def load_model(self, path):
@@ -26,6 +36,14 @@ class AISectaVision:
     def initialize_camera(self):
         cam = cv2.VideoCapture(0)
         return cam
+
+
+    def initialize_video_writer(self):
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        now = datetime.now()
+        filename = f"aisecta-{now.strftime('%d-%b-%Y %H:%M')}.avi"
+        video_writer = cv2.VideoWriter(filename, fourcc, 20, (640, 480))
+        return video_writer
 
     
     def calculate_detection_area(self, threshold):
@@ -61,16 +79,29 @@ class AISectaVision:
         return frame
 
 
+    def show_detection_zone(self, frame):
+        xmin, xmax = self.zone_detection
+        h = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cv2.rectangle(frame, (xmin, 0), (xmax, h), (0,255,0), 1)
+        
+        return frame
+
+
     def check_detection_zone(self, pest_cx):
         xmin, xmax = self.zone_detection
 
-        if len(pest_cx) and not self.detected:
+        if len(pest_cx):
             for x in pest_cx:
                 if xmin < x < xmax:
                     self.detected = True
                     self.time_detected = datetime.now() + timedelta(self.spray_duration)
-                    #self.sprayer.on()
+                    #self.stop_signal.on()
+                    self.serial.write(b"1")
+                    sleep(0.5)
+                    self.sprayer.on()
+                    
                     return
+
             self.detected = False
 
 
@@ -79,49 +110,57 @@ class AISectaVision:
         time_diff = (now - self.time_detected).seconds
 
         if time_diff > self.spray_duration:
-            # self.sprayer.off()
-            # 
+            self.sprayer.off()
+            #self.stop_signal.off()
+            self.serial.write(b"1")
             if time_diff > self.spray_duration + self.time_delay:
                 self.detected = False
 
 
     def process_frame(self, frame):
+        self.show_detection_zone(frame)
+
         if not(self.detected):
             frame = self.detect_pests(frame)
         else:
             self.check_spray_duration()
-        
-        xmin, xmax = self.zone_detection
-        h = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
-        cv2.rectangle(frame, (xmin, 0), (xmax, h), (0,255,0), 1)
 
         return frame
 
 
-    def run(self):
+    def run(self, record, show):
         while self.cam.isOpened():
             ret, frame = self.cam.read()
+            frame = cv2.flip(frame, 1)
+
+            if self.pest_signal_right.value:
+                self.serial.write(b"1")
+            
+            if record:
+                self.video_writer.write(frame)
 
             if not(ret):
                 return
 
             res = self.process_frame(frame)
-            res = cv2.flip(res, 1)
-            cv2.imshow("AI Secta Vision", res)
+            
+            if show:
+                cv2.imshow("AI Secta Vision", res)
 
             if (cv2.waitKey(1) & 0xFF == ord('q')):
                 break
 
-
+        self.video_writer.release()
         self.cam.release()
         cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     app = AISectaVision(
-        weights='model14j.onnx',
+        weights='model/model14j.onnx',
         spray_duration=3,
         time_delay=2,
-        zone_detection=20
+        zone_detection=40,
+        record=False
     )
-    app.run()    
+    app.run(record=True, show=False)    
